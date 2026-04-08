@@ -11,7 +11,7 @@ To simulate a continuously updating system, the pipeline will periodically retri
 # Setup
 # Install required packages
 # Make sure to create new environment with python = 3.10
-pip install -r week2-processing/requirements.txt
+pip install -r data-processing/requirements.txt
 
 # Download NLTK Data
 python -c "import nltk; nltk.download('stopwords'); nltk.download('punkt')"
