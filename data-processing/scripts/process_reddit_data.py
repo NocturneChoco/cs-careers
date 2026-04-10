@@ -1,426 +1,392 @@
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
-    col, regexp_replace, lower, trim, udf, 
-    when, lit, explode, split, count, to_date
+    col, lower, regexp_replace, split, explode, count, desc,
+    from_unixtime, year, month, dayofmonth, hour, length,
+    when, trim, udf, collect_list, avg, sum as spark_sum
 )
-from pyspark.sql.types import StringType, FloatType, ArrayType, StructType, StructField
+from pyspark.sql.types import StringType, ArrayType
+from pyspark.ml.feature import Tokenizer, StopWordsRemover, CountVectorizer, IDF
+from pyspark.ml import Pipeline
 import re
-from textblob import TextBlob
-import nltk
-from nltk.corpus import stopwords
-import boto3
-from datetime import datetime
-import config
+import json
 
 # Initialize Spark Session
-def create_spark_session():
-    """Create and configure Spark session with S3 access"""
-    spark = SparkSession.builder \
-        .appName(config.SPARK_APP_NAME) \
-        .config("spark.jars.packages", "org.apache.hadoop:hadoop-aws:3.3.4") \
-        .config("spark.hadoop.fs.s3a.access.key", config.AWS_ACCESS_KEY) \
-        .config("spark.hadoop.fs.s3a.secret.key", config.AWS_SECRET_KEY) \
-        .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem") \
-        .config("spark.sql.adaptive.enabled", "true") \
-        .config("spark.sql.adaptive.coalescePartitions.enabled", "true") \
-        .getOrCreate()
-    
-    spark.sparkContext.setLogLevel("WARN")
-    return spark
+spark = SparkSession.builder \
+    .appName("Reddit CS Career Analysis") \
+    .config("spark.driver.memory", "4g") \
+    .config("spark.sql.shuffle.partitions", "8") \
+    .getOrCreate()
 
+# Set log level to reduce verbosity
+spark.sparkContext.setLogLevel("WARN")
 
-# ============================================
-# TEXT CLEANING AND NORMALIZATION
-# ============================================
+print("=" * 80)
+print("REDDIT CS CAREER DATA PROCESSING PIPELINE")
+print("=" * 80)
 
-def clean_text_pipeline(df):
-    """
-    Comprehensive text cleaning pipeline
-    - Remove URLs, special characters
-    - Convert to lowercase
-    - Remove extra whitespace
-    - Remove Reddit-specific formatting
-    """
-    print("Starting text cleaning pipeline...")
-    
-    # Remove URLs (http, https, www)
-    df = df.withColumn(
-        "cleaned_title",
-        regexp_replace(col("title"), r"http\S+|www\.\S+", "")
-    )
-    df = df.withColumn(
-        "cleaned_body",
-        regexp_replace(col("selftext"), r"http\S+|www\.\S+", "")
-    )
-    
-    # Remove Reddit-specific markdown
-    df = df.withColumn(
-        "cleaned_title",
-        regexp_replace(col("cleaned_title"), r"\[.*?\]|\(.*?\)", "")
-    )
-    df = df.withColumn(
-        "cleaned_body",
-        regexp_replace(col("cleaned_body"), r"\[.*?\]|\(.*?\)", "")
-    )
-    
-    # Remove special characters (keep letters, numbers, spaces)
-    df = df.withColumn(
-        "cleaned_title",
-        regexp_replace(col("cleaned_title"), r"[^a-zA-Z0-9\s]", " ")
-    )
-    df = df.withColumn(
-        "cleaned_body",
-        regexp_replace(col("cleaned_body"), r"[^a-zA-Z0-9\s]", " ")
-    )
-    
-    # Convert to lowercase
-    df = df.withColumn("cleaned_title", lower(col("cleaned_title")))
-    df = df.withColumn("cleaned_body", lower(col("cleaned_body")))
-    
-    # Remove extra whitespace
-    df = df.withColumn("cleaned_title", trim(regexp_replace(col("cleaned_title"), r"\s+", " ")))
-    df = df.withColumn("cleaned_body", trim(regexp_replace(col("cleaned_body"), r"\s+", " ")))
-    
-    # Create combined text for analysis
-    df = df.withColumn(
-        "combined_text",
-        when(col("cleaned_body").isNotNull() & (col("cleaned_body") != ""),
-             concat(col("cleaned_title"), lit(" "), col("cleaned_body")))
-        .otherwise(col("cleaned_title"))
-    )
-    
-    print(f"Text cleaning complete. Processed {df.count()} posts.")
-    return df
+# ============================================================================
+# 1. DATA LOADING
+# ============================================================================
+print("\n[STEP 1] Loading raw Reddit data...")
 
+# Load the JSON data
+df = spark.read.json("data/raw_posts.json")
 
-def remove_stopwords_udf():
-    """UDF to remove stopwords from text"""
-    stop_words = set(stopwords.words('english'))
-    
-    def remove_stopwords(text):
-        if not text:
-            return ""
-        words = text.split()
-        filtered_words = [word for word in words if word not in stop_words]
-        return " ".join(filtered_words)
-    
-    return udf(remove_stopwords, StringType())
+print(f"✓ Loaded {df.count()} posts")
+print("\nData Schema:")
+df.printSchema()
 
+# ============================================================================
+# 2. DATA CLEANING & ENRICHMENT
+# ============================================================================
+print("\n[STEP 2] Cleaning and enriching data...")
 
-def apply_stopword_removal(df):
-    """Apply stopword removal to cleaned text"""
-    print("Removing stopwords...")
-    remove_stopwords = remove_stopwords_udf()
-    
-    df = df.withColumn("processed_text", remove_stopwords(col("combined_text")))
-    
-    print("Stopword removal complete.")
-    return df
+# Convert Unix timestamp to readable datetime
+df_cleaned = df.withColumn(
+    "created_datetime",
+    from_unixtime(col("created_utc"))
+)
 
+# Extract date components for time-based analysis
+df_cleaned = df_cleaned \
+    .withColumn("year", year(col("created_datetime"))) \
+    .withColumn("month", month(col("created_datetime"))) \
+    .withColumn("day", dayofmonth(col("created_datetime"))) \
+    .withColumn("hour", hour(col("created_datetime")))
 
-# ============================================
-# TOPIC CLASSIFICATION
-# ============================================
+# Combine title and selftext for complete content analysis
+df_cleaned = df_cleaned.withColumn(
+    "full_text",
+    when(col("selftext").isNull() | (col("selftext") == ""), col("title"))
+    .otherwise(regexp_replace(col("title") + " " + col("selftext"), r"\s+", " "))
+)
 
-def classify_topics(df):
-    """
-    Classify posts into predefined career-related topics
-    Topics: internship, job_search, interview, salary, courses, projects, resume
-    """
-    print("Starting topic classification...")
-    
-    # Define keyword patterns for each topic
-    topic_patterns = {
-        'internship': r'\b(intern|internship|co-op|coop|summer position)\b',
-        'job_search': r'\b(job|career|offer|employment|hiring|recruiter|application)\b',
-        'interview': r'\b(interview|leetcode|coding challenge|technical interview|behavioral|oa|online assessment)\b',
-        'salary': r'\b(salary|compensation|pay|tc|total comp|stock|rsu|bonus)\b',
-        'courses': r'\b(course|class|cs\d+|algorithm|data structure|operating system|database)\b',
-        'projects': r'\b(project|portfolio|github|side project|personal project)\b',
-        'resume': r'\b(resume|cv|curriculum vitae)\b',
-        'new_grad': r'\b(new grad|new-grad|entry level|junior)\b',
-        'faang': r'\b(faang|manga|big tech|google|amazon|meta|facebook|apple|netflix|microsoft)\b'
-    }
-    
-    # Apply pattern matching for each topic
-    for topic, pattern in topic_patterns.items():
-        df = df.withColumn(
-            f"topic_{topic}",
-            when(
-                col("combined_text").rlike(pattern), 1
-            ).otherwise(0)
-        )
-    
-    # Create primary topic (first match, prioritized)
-    df = df.withColumn(
-        "primary_topic",
-        when(col("topic_internship") == 1, "internship")
-        .when(col("topic_interview") == 1, "interview")
-        .when(col("topic_salary") == 1, "salary")
-        .when(col("topic_job_search") == 1, "job_search")
-        .when(col("topic_new_grad") == 1, "new_grad")
-        .when(col("topic_resume") == 1, "resume")
-        .when(col("topic_projects") == 1, "projects")
-        .when(col("topic_courses") == 1, "courses")
-        .when(col("topic_faang") == 1, "faang")
-        .otherwise("general")
-    )
-    
-    # Count total topics per post
-    topic_cols = [f"topic_{t}" for t in topic_patterns.keys()]
-    df = df.withColumn("topic_count", sum([col(c) for c in topic_cols]))
-    
-    print("Topic classification complete.")
-    print("Topic distribution:")
-    df.groupBy("primary_topic").count().orderBy(col("count").desc()).show()
-    
-    return df
+# Calculate text length
+df_cleaned = df_cleaned.withColumn(
+    "text_length",
+    length(col("full_text"))
+)
 
+# Categorize post engagement
+df_cleaned = df_cleaned.withColumn(
+    "engagement_level",
+    when(col("num_comments") == 0, "No Engagement")
+    .when(col("num_comments") <= 2, "Low Engagement")
+    .when(col("num_comments") <= 10, "Medium Engagement")
+    .otherwise("High Engagement")
+)
 
-# ============================================
-# SALARY EXTRACTION
-# ============================================
+# Identify if post contains a URL/image
+df_cleaned = df_cleaned.withColumn(
+    "has_media",
+    when(col("url").contains("i.redd.it") | col("url").contains("imgur"), "Image")
+    .when(col("url").contains("reddit.com/r/"), "Text Post")
+    .otherwise("External Link")
+)
 
-def extract_salaries_udf():
-    """
-    UDF to extract salary mentions from text
-    Patterns: $XXk, $XXX,XXX, XXk, etc.
-    """
-    salary_patterns = [
-        r'\$(\d{1,3})[kK]',                    # $120k
-        r'\$(\d{1,3}),?(\d{3})',               # $120,000 or $120000
-        r'(\d{1,3})[kK]\s*(?:salary|comp)',    # 120k salary
-        r'tc[:\s]*\$?(\d{1,3})[kK]',           # tc: 120k
-    ]
-    
-    def extract_salary(text):
-        if not text:
-            return None
-        
-        salaries = []
-        for pattern in salary_patterns:
-            matches = re.finditer(pattern, text, re.IGNORECASE)
-            for match in matches:
-                if 'k' in match.group().lower() or 'K' in match.group():
-                    # Extract number before 'k'
-                    num = re.search(r'(\d{1,3})', match.group())
-                    if num:
-                        salary = int(num.group(1)) * 1000
-                        if 30000 <= salary <= 500000:  # Reasonable range
-                            salaries.append(salary)
-                else:
-                    # Extract full number
-                    nums = re.findall(r'\d+', match.group())
-                    if nums:
-                        salary = int(''.join(nums))
-                        if 30000 <= salary <= 500000:
-                            salaries.append(salary)
-        
-        return float(max(salaries)) if salaries else None
-    
-    return udf(extract_salary, FloatType())
+print(f"✓ Cleaned and enriched {df_cleaned.count()} posts")
 
+# ============================================================================
+# 3. TEXT PREPROCESSING
+# ============================================================================
+print("\n[STEP 3] Preprocessing text for analysis...")
 
-def apply_salary_extraction(df):
-    """Extract salary mentions from posts"""
-    print("Extracting salary information...")
-    
-    extract_salary = extract_salaries_udf()
-    df = df.withColumn("mentioned_salary", extract_salary(col("combined_text")))
-    
-    salary_count = df.filter(col("mentioned_salary").isNotNull()).count()
-    print(f"Found {salary_count} posts with salary mentions.")
-    
-    return df
+# Clean text: lowercase, remove special characters, URLs
+df_text = df_cleaned.withColumn(
+    "cleaned_text",
+    lower(regexp_replace(
+        regexp_replace(
+            regexp_replace(col("full_text"), r"http\S+", ""),  # Remove URLs
+            r"[^a-zA-Z\s]", " "  # Remove special chars
+        ),
+        r"\s+", " "  # Normalize whitespace
+    ))
+)
 
+# Tokenization
+tokenizer = Tokenizer(inputCol="cleaned_text", outputCol="words")
+df_tokenized = tokenizer.transform(df_text)
 
-# ============================================
-# SENTIMENT ANALYSIS
-# ============================================
+# Remove stop words
+remover = StopWordsRemover(inputCol="words", outputCol="filtered_words")
+df_filtered = remover.transform(df_tokenized)
 
-def sentiment_analysis_udf():
-    """
-    UDF for sentiment analysis using TextBlob
-    Returns: polarity (-1 to 1), subjectivity (0 to 1), and category
-    """
-    def analyze_sentiment(text):
-        if not text or len(text.strip()) == 0:
-            return (0.0, 0.0, "neutral")
-        
-        try:
-            blob = TextBlob(text)
-            polarity = blob.sentiment.polarity
-            subjectivity = blob.sentiment.subjectivity
-            
-            # Categorize sentiment
-            if polarity > 0.1:
-                category = "positive"
-            elif polarity < -0.1:
-                category = "negative"
-            else:
-                category = "neutral"
-            
-            return (float(polarity), float(subjectivity), category)
-        except:
-            return (0.0, 0.0, "neutral")
-    
-    return udf(analyze_sentiment, StructType([
-        StructField("polarity", FloatType()),
-        StructField("subjectivity", FloatType()),
-        StructField("category", StringType())
-    ]))
+# Filter out very short posts (less than 3 words)
+df_filtered = df_filtered.filter(length(col("cleaned_text")) > 10)
 
+print(f"✓ Preprocessed {df_filtered.count()} posts")
 
-def apply_sentiment_analysis(df):
-    """Apply sentiment analysis to posts"""
-    print("Performing sentiment analysis...")
-    
-    analyze_sentiment = sentiment_analysis_udf()
-    df = df.withColumn("sentiment", analyze_sentiment(col("combined_text")))
-    
-    # Extract sentiment fields
-    df = df.withColumn("sentiment_polarity", col("sentiment.polarity"))
-    df = df.withColumn("sentiment_subjectivity", col("sentiment.subjectivity"))
-    df = df.withColumn("sentiment_category", col("sentiment.category"))
-    
-    # Drop intermediate column
-    df = df.drop("sentiment")
-    
-    print("Sentiment analysis complete.")
-    df.groupBy("sentiment_category").count().show()
-    
-    return df
+# ============================================================================
+# 4. KEYWORD & TOPIC EXTRACTION
+# ============================================================================
+print("\n[STEP 4] Extracting keywords and topics...")
 
+# Explode words for word frequency analysis
+df_words = df_filtered.select(
+    "id", "title", "score", "num_comments", "created_datetime",
+    explode(col("filtered_words")).alias("word")
+)
 
-# ============================================
-# KEYWORD AND SKILL EXTRACTION
-# ============================================
+# Calculate word frequencies
+word_freq = df_words.groupBy("word") \
+    .agg(count("*").alias("frequency")) \
+    .filter(length(col("word")) > 3) \
+    .orderBy(desc("frequency"))
 
-def extract_skills_keywords(df):
-    """Extract frequently mentioned skills and technologies"""
-    print("Extracting skills and keywords...")
-    
-    # Define common CS skills and technologies
-    skills_keywords = [
-        'python', 'java', 'javascript', 'typescript', 'c\\+\\+', 'cpp',
-        'react', 'angular', 'vue', 'node', 'express',
-        'sql', 'nosql', 'mongodb', 'postgres', 'mysql',
-        'aws', 'azure', 'gcp', 'docker', 'kubernetes',
-        'machine learning', 'ml', 'ai', 'deep learning',
-        'data structures', 'algorithms', 'leetcode',
-        'git', 'github', 'agile', 'scrum',
-        'api', 'rest', 'graphql',
-        'linux', 'unix', 'bash'
-    ]
-    
-    # Create binary columns for each skill
-    for skill in skills_keywords:
-        skill_col_name = f"skill_{skill.replace(' ', '_').replace('\\\\', '')}"
-        df = df.withColumn(
-            skill_col_name,
-            when(col("combined_text").rlike(rf'\b{skill}\b'), 1).otherwise(0)
-        )
-    
-    print("Skill extraction complete.")
-    return df
+print("\n📊 Top 20 Keywords:")
+word_freq.show(20, truncate=False)
 
+# Define career-related keyword categories
+def categorize_topic(text):
+    text_lower = text.lower()
+    
+    categories = []
+    
+    # Internship related
+    if any(word in text_lower for word in ['internship', 'intern', 'summer', 'co-op', 'coop']):
+        categories.append('Internship')
+    
+    # Job search related
+    if any(word in text_lower for word in ['job', 'application', 'apply', 'applying', 'offer', 'search']):
+        categories.append('Job Search')
+    
+    # Interview related
+    if any(word in text_lower for word in ['interview', 'leetcode', 'oa', 'assessment', 'coding challenge']):
+        categories.append('Interview Prep')
+    
+    # Resume/career advice
+    if any(word in text_lower for word in ['resume', 'cv', 'portfolio', 'project', 'experience']):
+        categories.append('Resume/Profile')
+    
+    # Salary/compensation
+    if any(word in text_lower for word in ['salary', 'compensation', 'pay', 'tc', 'offer']):
+        categories.append('Compensation')
+    
+    # Company specific
+    if any(word in text_lower for word in ['amazon', 'google', 'meta', 'microsoft', 'faang', 'big tech']):
+        categories.append('Big Tech')
+    
+    # Education
+    if any(word in text_lower for word in ['course', 'class', 'degree', 'major', 'masters', 'university', 'college']):
+        categories.append('Education')
+    
+    # Career advice/guidance
+    if any(word in text_lower for word in ['advice', 'help', 'question', 'should i', 'how to', 'tips']):
+        categories.append('Seeking Advice')
+    
+    # Rejection/struggle
+    if any(word in text_lower for word in ['reject', 'ghost', 'fail', 'struggle', 'difficult', 'hard']):
+        categories.append('Challenges')
+    
+    return categories if categories else ['General']
 
-# ============================================
-# MAIN PROCESSING PIPELINE
-# ============================================
+categorize_udf = udf(categorize_topic, ArrayType(StringType()))
 
-def process_reddit_data():
-    """Main function to orchestrate the entire processing pipeline"""
-    
-    print("="*60)
-    print("REDDIT CS CAREER DATA PROCESSING PIPELINE")
-    print("="*60)
-    
-    # 1. Create Spark session
-    spark = create_spark_session()
-    
-    # 2. Load raw data from S3
-    print("\n[STEP 1] Loading raw data from S3...")
-    s3_input_path = f"s3a://{config.S3_BUCKET}/{config.S3_RAW_DATA_PATH}*.json"
-    
-    try:
-        df = spark.read.json(s3_input_path)
-        print(f"Successfully loaded {df.count()} posts from S3")
-        print(f"Schema: {df.columns}")
-    except Exception as e:
-        print(f"Error loading data: {e}")
-        return
-    
-    # 3. Text cleaning and normalization
-    print("\n[STEP 2] Text Cleaning and Normalization...")
-    df = clean_text_pipeline(df)
-    df = apply_stopword_removal(df)
-    
-    # 4. Topic classification
-    print("\n[STEP 3] Topic Classification...")
-    df = classify_topics(df)
-    
-    # 5. Salary extraction
-    print("\n[STEP 4] Salary Extraction...")
-    df = apply_salary_extraction(df)
-    
-    # 6. Sentiment analysis
-    print("\n[STEP 5] Sentiment Analysis...")
-    df = apply_sentiment_analysis(df)
-    
-    # 7. Skill extraction
-    print("\n[STEP 6] Skill and Keyword Extraction...")
-    df = extract_skills_keywords(df)
-    
-    # 8. Add processing metadata
-    df = df.withColumn("processed_date", lit(datetime.now().strftime("%Y-%m-%d")))
-    df = df.withColumn("post_date", to_date(col("created_utc").cast("timestamp")))
-    
-    # 9. Select final columns
-    final_columns = [
-        'id', 'title', 'selftext', 'author', 'subreddit', 
-        'score', 'num_comments', 'created_utc', 'post_date',
-        'cleaned_title', 'cleaned_body', 'combined_text', 'processed_text',
-        'primary_topic', 'topic_count',
-        'mentioned_salary',
-        'sentiment_polarity', 'sentiment_subjectivity', 'sentiment_category',
-        'processed_date'
-    ]
-    
-    # Add topic flags
-    topic_cols = [c for c in df.columns if c.startswith('topic_')]
-    skill_cols = [c for c in df.columns if c.startswith('skill_')]
-    final_columns.extend(topic_cols)
-    final_columns.extend(skill_cols)
-    
-    df_final = df.select(*final_columns)
-    
-    # 10. Save to Parquet format in S3
-    print("\n[STEP 7] Saving processed data to S3...")
-    s3_output_path = f"s3a://{config.S3_BUCKET}/{config.S3_PROCESSED_DATA_PATH}processed_posts.parquet"
-    
-    df_final.write \
-        .mode("overwrite") \
-        .partitionBy("post_date") \
-        .parquet(s3_output_path)
-    
-    print(f"Successfully saved processed data to {s3_output_path}")
-    
-    # 11. Generate summary statistics
-    print("\n" + "="*60)
-    print("PROCESSING SUMMARY")
-    print("="*60)
-    print(f"Total posts processed: {df_final.count()}")
-    print(f"\nTopic Distribution:")
-    df_final.groupBy("primary_topic").count().orderBy(col("count").desc()).show()
-    print(f"\nSentiment Distribution:")
-    df_final.groupBy("sentiment_category").count().show()
-    print(f"\nPosts with salary mentions: {df_final.filter(col('mentioned_salary').isNotNull()).count()}")
-    
-    # Stop Spark session
-    spark.stop()
-    print("\nPipeline execution complete!")
+df_categorized = df_filtered.withColumn(
+    "topics",
+    categorize_udf(col("full_text"))
+)
 
+# Explode topics for counting
+df_topics = df_categorized.select(
+    "id", "title", "score", "num_comments",
+    explode(col("topics")).alias("topic")
+)
 
-if __name__ == "__main__":
-    process_reddit_data()
+topic_distribution = df_topics.groupBy("topic") \
+    .agg(
+        count("*").alias("post_count"),
+        avg("score").alias("avg_score"),
+        avg("num_comments").alias("avg_comments")
+    ) \
+    .orderBy(desc("post_count"))
+
+print("\n📋 Topic Distribution:")
+topic_distribution.show(truncate=False)
+
+# ============================================================================
+# 5. TF-IDF ANALYSIS
+# ============================================================================
+print("\n[STEP 5] Running TF-IDF analysis...")
+
+# CountVectorizer to get term frequencies
+cv = CountVectorizer(inputCol="filtered_words", outputCol="raw_features", vocabSize=500)
+cv_model = cv.fit(df_filtered)
+df_cv = cv_model.transform(df_filtered)
+
+# IDF to get importance weights
+idf = IDF(inputCol="raw_features", outputCol="features")
+idf_model = idf.fit(df_cv)
+df_tfidf = idf_model.transform(df_cv)
+
+# Get vocabulary
+vocabulary = cv_model.vocabulary
+
+print(f"✓ Extracted {len(vocabulary)} unique terms")
+print(f"\nSample vocabulary: {vocabulary[:20]}")
+
+# ============================================================================
+# 6. ENGAGEMENT ANALYSIS
+# ============================================================================
+print("\n[STEP 6] Analyzing post engagement patterns...")
+
+# Engagement by topic
+engagement_by_topic = df_topics.groupBy("topic") \
+    .agg(
+        avg("score").alias("avg_upvotes"),
+        avg("num_comments").alias("avg_comments"),
+        count("*").alias("total_posts")
+    ) \
+    .orderBy(desc("avg_comments"))
+
+print("\n💬 Engagement by Topic:")
+engagement_by_topic.show(truncate=False)
+
+# Engagement by hour of day
+engagement_by_hour = df_cleaned.groupBy("hour") \
+    .agg(
+        count("*").alias("post_count"),
+        avg("score").alias("avg_score"),
+        avg("num_comments").alias("avg_comments")
+    ) \
+    .orderBy("hour")
+
+print("\n🕐 Engagement by Hour of Day:")
+engagement_by_hour.show(24, truncate=False)
+
+# ============================================================================
+# 7. COMPANY MENTIONS EXTRACTION
+# ============================================================================
+print("\n[STEP 7] Extracting company mentions...")
+
+companies = ['amazon', 'google', 'meta', 'facebook', 'microsoft', 'apple', 
+             'netflix', 'uber', 'lyft', 'airbnb', 'salesforce', 'oracle',
+             'ibm', 'intel', 'nvidia', 'tesla', 'spotify', 'twitter', 'x corp']
+
+def extract_companies(text):
+    if not text:
+        return []
+    text_lower = text.lower()
+    found = [company for company in companies if company in text_lower]
+    return found if found else []
+
+extract_companies_udf = udf(extract_companies, ArrayType(StringType()))
+
+df_companies = df_filtered.withColumn(
+    "mentioned_companies",
+    extract_companies_udf(col("full_text"))
+).filter(length(col("mentioned_companies")) > 0)
+
+df_company_mentions = df_companies.select(
+    explode(col("mentioned_companies")).alias("company"),
+    "score",
+    "num_comments"
+)
+
+company_stats = df_company_mentions.groupBy("company") \
+    .agg(
+        count("*").alias("mention_count"),
+        avg("score").alias("avg_score"),
+        avg("num_comments").alias("avg_engagement")
+    ) \
+    .orderBy(desc("mention_count"))
+
+print("\n🏢 Company Mentions:")
+company_stats.show(truncate=False)
+
+# ============================================================================
+# 8. SENTIMENT INDICATORS
+# ============================================================================
+print("\n[STEP 8] Analyzing sentiment indicators...")
+
+# Simple sentiment based on keywords
+def get_sentiment(text):
+    if not text:
+        return "Neutral"
+    
+    text_lower = text.lower()
+    
+    positive_words = ['success', 'offer', 'accepted', 'great', 'excited', 'happy', 
+                      'amazing', 'awesome', 'love', 'best', 'good', 'congratulations']
+    negative_words = ['reject', 'ghost', 'fail', 'sad', 'depressed', 'anxious', 
+                      'worried', 'stress', 'difficult', 'hard', 'no response', 'bad']
+    
+    pos_count = sum(1 for word in positive_words if word in text_lower)
+    neg_count = sum(1 for word in negative_words if word in text_lower)
+    
+    if pos_count > neg_count:
+        return "Positive"
+    elif neg_count > pos_count:
+        return "Negative"
+    else:
+        return "Neutral"
+
+sentiment_udf = udf(get_sentiment, StringType())
+
+df_sentiment = df_filtered.withColumn(
+    "sentiment",
+    sentiment_udf(col("full_text"))
+)
+
+sentiment_dist = df_sentiment.groupBy("sentiment") \
+    .agg(
+        count("*").alias("count"),
+        avg("score").alias("avg_score"),
+        avg("num_comments").alias("avg_comments")
+    ) \
+    .orderBy(desc("count"))
+
+print("\n😊 Sentiment Distribution:")
+sentiment_dist.show(truncate=False)
+
+# ============================================================================
+# 9. SAVE PROCESSED DATA
+# ============================================================================
+print("\n[STEP 9] Saving processed data...")
+
+# Save topic analysis
+topic_distribution.coalesce(1).write.mode("overwrite").json("data-processing/topic_analysis")
+print("✓ Saved topic_analysis")
+
+# Save word frequencies
+word_freq.limit(200).coalesce(1).write.mode("overwrite").json("data-processing/word_frequencies")
+print("✓ Saved word_frequencies")
+
+# Save engagement analysis
+engagement_by_topic.coalesce(1).write.mode("overwrite").json("data-processing/engagement_by_topic")
+engagement_by_hour.coalesce(1).write.mode("overwrite").json("data-processing/engagement_by_hour")
+print("✓ Saved engagement analyses")
+
+# Save company mentions
+company_stats.coalesce(1).write.mode("overwrite").json("data-processing/company_mentions")
+print("✓ Saved company_mentions")
+
+# Save sentiment analysis
+sentiment_dist.coalesce(1).write.mode("overwrite").json("data-processing/sentiment_analysis")
+print("✓ Saved sentiment_analysis")
+
+# Save full processed dataset
+df_categorized.select(
+    "id", "title", "full_text", "score", "num_comments",
+    "created_datetime", "year", "month", "day", "hour",
+    "engagement_level", "has_media", "text_length", "topics"
+).coalesce(1).write.mode("overwrite").json("data-processing/processed_posts")
+print("✓ Saved processed_posts")
+
+# ============================================================================
+# 10. SUMMARY STATISTICS
+# ============================================================================
+print("\n" + "=" * 80)
+print("PROCESSING COMPLETE - SUMMARY STATISTICS")
+print("=" * 80)
+
+print(f"\n📊 Total Posts Processed: {df_filtered.count()}")
+print(f"📅 Date Range: {df_cleaned.agg({'created_datetime': 'min'}).collect()[0][0]} to {df_cleaned.agg({'created_datetime': 'max'}).collect()[0][0]}")
+print(f"💬 Total Comments: {df_cleaned.agg({'num_comments': 'sum'}).collect()[0][0]}")
+print(f"⬆️  Total Upvotes: {df_cleaned.agg({'score': 'sum'}).collect()[0][0]}")
+print(f"📝 Average Post Length: {df_cleaned.agg({'text_length': 'avg'}).collect()[0][0]:.0f} characters")
+
+print("\n✅ All processing complete! Check data-processing/ folder for outputs.")
+
+# Stop Spark session
+spark.stop()
